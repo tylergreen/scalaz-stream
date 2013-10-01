@@ -15,13 +15,14 @@ object Chunk {
   trait Fold[A,B] {
     def run[S](c: Chunk[S,A]): ST[S,B]
   }
-  class Bytes[S](arr: Array[Byte]) extends Chunk[S,Byte] {
+  class Bytes[S](arr: Array[Byte], var pos: Int) extends Chunk[S,Byte] {
     def foldN[@specialized B](n: Long)(z: B)(f: (B,Byte) => B): ST[S,B] = ST {
       var b = z
-      var i = 0
-      while (i < n && i < arr.length) {
-        b = f(b,arr(i)) 
+      var i = 0L
+      while (i < n && pos < arr.length) {
+        b = f(b,arr(pos)) 
         i += 1
+        pos += 1
       }
       b
     }

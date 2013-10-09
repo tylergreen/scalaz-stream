@@ -1,11 +1,12 @@
 package scalaz.stream.async.mutable
 
 import scalaz.stream.message
-import scalaz.concurrent.{Task, Actor}
+import scalaz.concurrent.{Strategy, Task, Actor}
 import scalaz.stream.Process
 import scalaz.stream.Process._
 import scalaz.stream.processes._
 import scala.concurrent.duration.{FiniteDuration, Deadline, Duration}
+import scalaz.syntax.Ops
 
 /**
  * Represents topic, that asynchronously exchanges messages between one or more publisher(s) 
@@ -95,7 +96,13 @@ trait Topic[A] {
 
 }
 
+
+
 object Topic {
+  
+  
+  implicit class TopicSyntax[A](val self:Topic[A]) extends TopicOps[A] 
+  
 
   object journal {
 

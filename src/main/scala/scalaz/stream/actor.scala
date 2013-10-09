@@ -5,8 +5,7 @@ import scalaz.concurrent.{Actor, Strategy, Task}
 import scalaz.\/._
 
 import collection.immutable.Queue
-import scalaz.stream.Process.End
-import scalaz.stream.async.immutable
+import scalaz.stream.Process._ 
 
 trait actor {
 
@@ -252,10 +251,12 @@ trait actor {
    * message.topic.UnSubscribe  - Un-subscribes subscriber
    * message.topic.Get          - Registers callback or gets messages in subscriber`s queue 
    * 
-   * Signal is notified always when the count of subscribers changes, and is set with very first subscriber
+   * 
+   * Supplied journal is fed every published message to this actor. It is then consulted to fed the journaled messages
+   * to subscribers for eventual reconciliation.
    * 
    */
-  def topic[A](implicit S:Strategy) :(Actor[message.topic.Msg[A]]) = {
+  def topic[A](journal:Process1[A,A])(implicit S:Strategy) :(Actor[message.topic.Msg[A]]) = {
     import message.topic._
     
     var subs = List[SubscriberRefInstance[A]]()
@@ -266,6 +267,8 @@ trait actor {
     //left when this topic actor terminates or finishes
     var terminated : Throwable \/ Unit = open
     
+    var history : Process1[A,A] = journal
+    
     @inline def ready = terminated.isRight
     
     
@@ -273,6 +276,7 @@ trait actor {
 
       //Publishes message in the topic
       case Publish(a,cb) if ready =>
+         history = history.feed1(a)
          subs.foreach(_.publish(a))   
          S(cb(open))
 
@@ -282,7 +286,8 @@ trait actor {
          ref.get(cb)                 
 
       //Stops or fails this topic  
-      case Fail(err, cb) if ready =>
+      case Fail(err, cb) if ready => 
+        history = journal //journal cleanup
         subs.foreach(_.fail(err))
         subs = Nil
         terminated = left(err)
@@ -291,10 +296,14 @@ trait actor {
       
       // Subscribes subscriber
       // When subscriber terminates it MUST send un-subscribe to release all it's resources
-      case Subscribe(cb) if ready =>
-        val subRef = new SubscriberRefInstance[A](left(Queue()))(S)
+      case Subscribe(cb, reconcile, buffer) if ready =>
+        val subRef = new SubscriberRefInstance[A](left(buffer),buffer)(S)
+        val inJournal = history.flush
         subs = subs :+ subRef
-        S(cb(right(subRef)))
+        S { 
+          val reconciled = (emitAll(inJournal) |> reconcile).flush 
+          cb(right((reconciled,subRef)))
+        }
 
       // UnSubscribes the subscriber. 
       // This will actually un-subscribe event when this topic terminates  
@@ -314,7 +323,7 @@ trait actor {
 
       case Fail(_,cb) =>  S(cb(terminated))
 
-      case Subscribe(cb) => S(cb(terminated.bimap(t=>t,r=>sys.error("impossible"))))
+      case Subscribe(cb,_,_) => S(cb(terminated.bimap(t=>t,r=>sys.error("impossible"))))
 
       
     }
@@ -363,30 +372,31 @@ object message {
     case class Publish[A](a:A, cb:(Throwable \/ Unit) => Unit) extends Msg[A]
     case class Fail[A](t:Throwable, cb:(Throwable \/ Unit) => Unit) extends Msg[A]
     
-    case class Subscribe[A](cb:(Throwable \/ SubscriberRef[A]) => Unit) extends Msg[A]
+    case class Subscribe[A](cb:(Throwable \/ (Seq[A],SubscriberRef[A])) => Unit, reconcile:Process1[A,A], buffer:Process1[A,A]) extends Msg[A]
     case class UnSubscribe[A](ref:SubscriberRef[A], cb:(Throwable \/ Unit) => Unit) extends Msg[A]
     case class Get[A](ref:SubscriberRef[A], cb: (Throwable \/ Seq[A]) => Unit) extends Msg[A]
 
     
     //For safety we just hide the mutable functionality from the ref which we passing around
-    sealed trait SubscriberRef[A] 
+    sealed trait SubscriberRef[A]
 
     
     // all operations on this class are guaranteed to run on single thread, 
     // however because actor`s handler closure is not capturing `cbOrQueue`
     // It must be tagged volatile
-    final class SubscriberRefInstance[A](@volatile var cbOrQueue : Queue[A] \/  ((Throwable \/ Seq[A]) => Unit))(implicit S:Strategy) 
+    final class SubscriberRefInstance[A](@volatile var cbOrQueue : Process1[A,A] \/  ((Throwable \/ Seq[A]) => Unit)
+                                          , val buffer: Process1[A,A])(implicit S:Strategy) 
       extends SubscriberRef[A] {
 
       //Publishes to subscriber or enqueue for next `Get`
-      def publish(a:A)  = 
+      def publish(a:A)  =
         cbOrQueue = cbOrQueue.fold(
-         q => left(q.enqueue(a))
-         , cb => {
+          pq => left(pq.feed1(a))
+          , cb => {
             S(cb(right(List(a))))
-            left(Queue())
+            left(buffer)
           }
-        )
+        ) 
          
       //fails the current call back, if any
       def fail(e:Throwable) = cbOrQueue.map(cb=>S(cb(left(e))))
@@ -394,14 +404,16 @@ object message {
       //Gets new data or registers call back
       def get(cb:(Throwable \/ Seq[A]) => Unit) = 
         cbOrQueue = cbOrQueue.fold(
-         q =>  
+         l = { pq => 
+           val q = pq.flush
            if (q.isEmpty) {
              right(cb)
            } else {
              S(cb(right(q)))
-             left(Queue())
+             left(buffer)
            }
-         , cb => {
+         }
+         , r = cb => {
             // this is invalid state cannot have more than one callback
             // we will fail this new callback
             S(cb(left(new Exception("Only one callback allowed"))))
@@ -412,11 +424,12 @@ object message {
       //Fails the callback, or when something in Q, flushes it to callback
       def flush(cb:(Throwable \/ Seq[A]) => Unit, terminated: Throwable \/ Unit) =
         cbOrQueue = cbOrQueue.fold(
-         q => {
+         l = pq => {
+           val q = pq.flush
            if (q.isEmpty) cb(terminated.map(_=>Nil)) else cb(right(q)) 
-           left(Queue())
+           left(buffer)
          }
-         , cb => {
+         , r = cb => {
             S(cb(left(new Exception("Only one callback allowed"))))
             cbOrQueue
           }  

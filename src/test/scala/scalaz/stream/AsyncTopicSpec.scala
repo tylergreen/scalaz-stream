@@ -126,14 +126,14 @@ object AsyncTopicSpec extends Properties("topic") {
         (emitAll(before).evalMap(Task.now(_)) to topic.publish).run.run
 
         val sub1 = new SyncVar[Throwable \/ Seq[Int]]
-        Task(topic.subscribe.collect.runAsync(sub1.put)).run
+        Task(topic.subscribe.runLog.runAsync(sub1.put)).run
         
 
         val emitted = new SyncVar[Throwable \/ Unit]
         Task((Process.emitAll(after).evalMap(Task.now(_)) to topic.publish).run.runAsync(emitted.put)).run
 
         val sub2 = new SyncVar[Throwable \/ Seq[Int]]
-        Task(topic.subscribe.collect.runAsync(sub2.put)).run
+        Task(topic.subscribe.runLog.runAsync(sub2.put)).run
 
         val emittedAll = emitted.get(3000)
         
@@ -204,7 +204,7 @@ object AsyncTopicSpec extends Properties("topic") {
         (emitAll(before).evalMap(Task.now(_)) to topic.publish).run.run
 
         val sub1 = new SyncVar[Throwable \/ Seq[Int]]
-        topic.subscribe(filter[Int](_ % 2 == 0), Topic.buffer.all).collect.runAsync(sub1.put)
+        topic.subscribe(filter[Int](_ % 2 == 0), Topic.buffer.all).runLog.runAsync(sub1.put)
 
         val emitted = new SyncVar[Throwable \/ Unit]
         Task((Process.emitAll(after).evalMap(Task.now(_)) to topic.publish).run.runAsync(emitted.put)).run
@@ -235,7 +235,7 @@ object AsyncTopicSpec extends Properties("topic") {
       val observedBuffer = id[Int].flatMap(i => { observer = observer :+ i ; halt })
       
       val sub1 = new SyncVar[Throwable \/ Seq[Int]] 
-      Task((topic.subscribe(id, observedBuffer) zip (awakeEvery(4 millis))).map(_._1).collect.runAsync(sub1.put)).run
+      Task((topic.subscribe(id, observedBuffer) zip (awakeEvery(4 millis))).map(_._1).runLog.runAsync(sub1.put)).run
 
       val emitted = new SyncVar[Throwable \/ Unit]
       Task((Process.emitAll(l).evalMap(v=>Task.delay{ Thread.sleep(2);v }) to topic.publish).run.runAsync(emitted.put)).run

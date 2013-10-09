@@ -4,7 +4,7 @@ name := "scalaz-stream"
 
 version := "0.1-SNAPSHOT"
 
-scalaVersion := "2.10.2"
+scalaVersion := "2.10.1"
 
 scalacOptions ++= Seq(
   "-feature",
@@ -16,10 +16,9 @@ scalacOptions ++= Seq(
 
 conflictManager := ConflictManager.strict
 
-libraryDependencies ++= Seq(
-  "org.scalaz" %% "scalaz-core" % "7.1.0-SNAPSHOT",
-  "org.scalaz" %% "scalaz-concurrent" % "7.1.0-SNAPSHOT",
-  "org.scalaz" %% "scalaz-scalacheck-binding" % "7.1.0-SNAPSHOT" % "test",
+libraryDependencies ++= Seq( 
+  "org.scalaz" %% "scalaz-concurrent" % "7.0.4",
+  "org.scalaz" %% "scalaz-scalacheck-binding" % "7.0.4" % "test",
   "org.scalacheck" %% "scalacheck" % "1.10.0" % "test"
 )
 

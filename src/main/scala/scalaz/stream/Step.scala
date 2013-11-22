@@ -14,4 +14,7 @@ case class Step[+F[_],+A](
 
   def fold[R](success: Seq[A] => R)(fallback: => R, error: => R): R =
     head.fold(e => if (e == Process.End) fallback else error, success)
+
+  def handle[R](success: Seq[A] => R)(fallback: => R, error: Throwable => R): R =
+    head.fold(e => if (e == Process.End) fallback else error(e), success)
 }

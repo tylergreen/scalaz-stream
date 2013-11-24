@@ -21,21 +21,19 @@ trait MergeN {
 
     trait M
     case class Get(cb: Throwable \/ Seq[B] => Unit) extends M
-    case class Recv(ind: Int, step: Step[Task,A]) extends M
-    case class Open(stream: Step[Task, Process[Task,A]]) extends M
+    case class Recv(ind: Int, step: Step[Task,A], required: Boolean) extends M
+    case class Open(stream: Step[Task, Process[Task,A]], required: Boolean) extends M
 
     var a: Actor[M] = null
     def pullL(required: Boolean) = {
       rem.foreach { _.step.runLastOr(sys.error("unpossible"))
-                     .map { a ! Open(_) }
+                     .map { a ! Open(_, required) }
                      .runAsync(_ => ()) }
-      if (required) rem.foreach(s => if (s.isHalt) q.close)
       rem = None
     }
     def pullR(required: Boolean) = {
-      if (outstanding <= 0 && required) q.close
       idle.foreach { case (ind, p) => p.step.runLastOr(sys.error("unpossible"))
-          .map { a ! Recv(ind, _) }
+          .map { a ! Recv(ind, _, required) }
           .runAsync(_ => ())
       }
       idle = IntMap()
@@ -52,25 +50,25 @@ trait MergeN {
           case AwaitR(_,_,_) => pullR(true)
           case AwaitBoth(_,_,_) =>
             if (math.random < .5) { pullL(false); pullR(false) }
-            else { pullR(false); pullL(false) }
+            else { pullR(true); pullL(true) }
         }
         q.dequeue(cb)
-      case Recv(ind, step) =>
+      case Recv(ind, step, required) =>
         idle = if (step.tail.isHalt) idle else idle + (ind -> step.tail)
         step.handle { hd => cur = scalaz.stream.wye.feedR(hd)(cur) } (
-          if (kill && rem.map(_.isHalt).getOrElse(false)) q.close else (),
+          if (kill && required) q.close else (),
           q.fail
         )
         val (h, t) = cur.unemit
         if (h.nonEmpty) q.enqueue(h)
         cur = t
-      case Open(step) =>
+      case Open(step, required) =>
         step.handle { hd =>
           idle = idle ++ hd.map((fresh,_))
           outstanding += hd.size
           cur = scalaz.stream.wye.feed1L(outstanding)(cur)
           rem = Some(step.tail)
-        } (rem = Some(halt), q.fail)
+        } (if (required) q.close, q.fail)
     } (Strategy.Sequential)
 
     repeatEval(Task.async[Seq[B]](cb => a ! Get(cb))).flatMap(emitSeq(_))

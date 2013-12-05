@@ -254,10 +254,10 @@ trait process1 {
     p match {
       case h@Halt(_) => h
       case Emit(h, t) => Emit(h map left, liftL(t))
-      case _ => await1[A \/ C].flatMap {
+      case _ => receive1[A \/ C, B \/ C]({
         case -\/(a) => liftL(feed1(a)(p))
-        case \/-(c) => emit(right(c)) ++ liftL(p)
-      }
+        case \/-(c) => emit(right(c)) fby liftL(p)
+      })
     }
 
   /**

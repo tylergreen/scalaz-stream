@@ -3,7 +3,7 @@ package actor
 
 import Process._
 import scala.collection.immutable.IntMap
-import scalaz.\/
+import scalaz.{\/,-\/,\/-}
 import scalaz.\/._
 import scalaz.concurrent.{Actor,Strategy,Task}
 import wye.{AwaitL,AwaitR,AwaitBoth}

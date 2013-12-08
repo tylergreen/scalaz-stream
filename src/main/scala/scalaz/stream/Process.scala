@@ -1,26 +1,20 @@
 package scalaz.stream
 
-import scalaz.stream.actor.{WyeActor, message, actors}
-import scala.collection.immutable.{IndexedSeq,SortedMap,Queue,Vector}
-import scala.concurrent.duration._
-
 import scalaz._
-import scalaz.concurrent.{Strategy, Task}
-import scalaz.Leibniz.===
-import scalaz.std.stream._
-import scalaz.syntax.foldable._
-import \/._
-import ReceiveY.{ReceiveL,ReceiveR}
-
-import java.util.concurrent._
-import scala.annotation.tailrec
-import scalaz.Free.Trampoline
-import scalaz.stream.ReceiveY.ReceiveL
 import scala.Some
 import scalaz.\/-
 import scalaz.-\/
-import scalaz.stream.ReceiveY.ReceiveR
+import \/._
+import java.util.concurrent._
 import scala.Ordering
+import scala.Some
+import scala.collection.immutable.{IndexedSeq,SortedMap,Queue,Vector}
+import scala.concurrent.duration._
+import scalaz.-\/
+import scalaz.Free.Trampoline
+import scalaz.concurrent.{Strategy, Task}
+import scalaz.stream.actor.{WyeActor, message, actors}
+
 
 /**
  * A `Process[F,O]` represents a stream of `O` values which can interleave
@@ -37,38 +31,66 @@ sealed abstract class Process[+F[_],+O] {
   import Process._
 
   /** Transforms the output values of this `Process` using `f`. */
-  final def map[O2](f: O => O2): Process[F,O2] = {
+  final def map[B](f: O => B): Process[F,B] = {
+    this match {
+      case h@Halt(_) => h
+      case AwaitF_(req,recv) =>  awaitT[F,Any,B](req)(r => recv(r).map(_ map f))
+      case Emit(h,t) =>
+        try Emit[F,B](h map f, t map f)
+        catch {
+          case rsn: Throwable => t match {
+            case AwaitF_(req,recv) => recv(-\/(rsn)).run map f
+            case _ => Halt(rsn)   //this assumes that emit has in tail only `NotReady`
+          }
+        }
+    }
+
     // a bit of trickness here - in the event that `f` itself throws an
     // exception, we use the most recent rcv from `Await` to  run cleanup
-//    def go(cur: Process[F,O], fb : (Throwable \/ O) => Trampoline[Process[F,O]]): Process[F,O2] =
-//      cur match {
-//        case h@Halt(_) => h
-//        case Await(req,recv) =>
-//          await(req)(r => Trampoline.suspend( go(recv(r),recv)))
-//          //Await[F,Any,O2](req, recv andThen (go(_, fb, c)), fb map f, c map f)
-//        case Emit(h, t) =>
-//          try Emit[F,O2](h map f, go(t,rcv))
-//          catch {
-//            case rsn : Throwable => fb(-\/(rsn)).run
-//          }
-//          /*
+   /* def go(cur: Process[F,O], fb : (Throwable \/ O) => Trampoline[Process[F,O]]): Process[F,O2] =
+      cur match {
+        case h@Halt(_) => h
+        case Await_(req,recv) =>
+          awaitT(req)(r => recv(r).map(p=>go(p,recv)))
+          //Await[F,Any,O2](req, recv andThen (go(_, fb, c)), fb map f, c map f)
+        case Emit(h, t) =>
+          try Emit[F,O2](h map f, go(t,fb))
+          catch {
+            case rsn : Throwable => fb(-\/(rsn)).map(_.map(f)).run
+          }
+
 //          try Emit[F,O2](h map f, go(t, fallback, cleanup))
 //          catch {
 //            case End => fallback.map(f)
 //            case e: Throwable => cleanup.map(f).causedBy(e)
 //          }
-//          */
-//      }
-//    //
-//    go(this, _ => Trampoline.done(halt))
-    ???
+
+      }
+    go(this, _ => Trampoline.done(halt))
+    //go(this,halt,halt)
+
+    */
   }
 
   /**
    * Generate a `Process` dynamically for each output of this `Process`, and
    * sequence these processes using `append`.
    */
-  final def flatMap[F2[x]>:F[x], O2](f: O => Process[F2,O2]): Process[F2,O2] = {
+  final def flatMap[F2[x]>:F[x], B](f: O => Process[F2,B]): Process[F2,B] = {
+    this match {
+      case h@Halt(_) => h
+      case AwaitF_(req,recv) => awaitT[F2,Any,B](req)(r=> recv(r).map(p=>p.flatMap(f)))
+      case Emit(as,t) =>
+        if (as.nonEmpty) {
+          try (f(as.head) ++ (emitSeq(as.tail,t) flatMap f))
+          catch {
+            case rsn: Throwable => t match {
+              case AwaitF_(req,recv) => recv(-\/(rsn)).run flatMap f
+              case _ => Halt(rsn)
+            }
+          }
+        } else t flatMap f
+    }
     // a bit of trickness here - in the event that `f` itself throws an
     // exception, we use the most recent fallback/cleanup from the prior `Await`
 //    def go(cur: Process[F,O], fallback: Process[F,O], cleanup: Process[F,O]): Process[F2,O2] =
@@ -100,7 +122,21 @@ sealed abstract class Process[+F[_],+O] {
    * Note that `p2` is appended to the `fallback` argument of any `Await`
    * produced by this `Process`. If this is not desired, use `fby`.
    */
-  final def append[F2[x]>:F[x], O2>:O](p2: => Process[F2,O2]): Process[F2,O2] = {
+  final def append[F2[x]>:F[x], B>:O](p2: => Process[F2,B]): Process[F2,B] = {
+    this match {
+      case h@Halt(End) =>
+        try p2
+        catch {
+          case End => h
+          case e : Throwable => Halt(e)
+        }
+      case h@Halt(_) => h
+      case Emit(h,t) => emitSeq(h, t append p2)
+      case AwaitF_(req,recv) => awaitTP[F2,B](req,recv)( _ append p2  )
+    }
+
+
+
 //    this match {
 //      case h@Halt(e) => e match {
 //        case End =>
@@ -235,6 +271,15 @@ sealed abstract class Process[+F[_],+O] {
     }
   }
   private final def causedBy_[F2[x]>:F[x],O2>:O](e: Throwable): Process[F2, O2] = {
+    this match {
+      case AwaitF_(req,rcv) => awaitTP(req, rcv)( _ causedBy_(e))
+      case Emit(h,t) => Emit(h, t.causedBy_(e))
+      case h@Halt(e0) => e0 match {
+                    case End => Halt(e)
+                   case _ => Halt(CausedBy(e0, e))
+      }
+    }
+
 //    this match {
 //          case Await(req,recv,fb,c) =>
 //            Await(req, recv andThen (_.causedBy_(e)), fb.causedBy_(e), c.causedBy_(e))
@@ -279,6 +324,50 @@ sealed abstract class Process[+F[_],+O] {
 //    }
 //    go(this)
     ???
+  }
+
+  /**
+   *
+   *  {{{
+   *
+   *    try {
+   *
+   *    } catch {
+   *      case e => p2(e)
+   *    }
+   *
+   *    //onFail
+   *
+   *    try {
+   *
+   *    } catch {
+   *      case End => Halt(e)
+   *      case e => p2(e)
+   *    }
+   *
+   *    //onComplete
+   *
+   *    try {
+   *
+   *    } catch {
+   *      case End => p2
+   *      case e => Halt(e)
+   *    }
+   *
+   *
+   *  }}}
+   */
+  final def onCleanup[F2[x]>:F[x],B>:O](p2: Throwable => Process[F2,B]): Process[F2,B] = {
+    this match {
+      case AwaitF_(req,recv) => awaitTP[F2,B](req,recv)(_ onCleanup p2)
+      case Emit(h,t) => Emit(h, t.onCleanup(p2))
+      case h@Halt(e) =>
+        try p2(e)
+        catch {
+          case End => h
+          case e2: Throwable => Halt(CausedBy(e2, e))
+        }
+    }
   }
 
   /**
@@ -420,6 +509,12 @@ sealed abstract class Process[+F[_],+O] {
    * is killed using `kill`, giving it the opportunity to clean up.
    */
   final def pipe[O2](p2: Process1[O,O2]): Process[F,O2] = {
+    p2 match {
+      case h@Halt(e) => this.causedBy(e) ++ h
+      case Emit(h,t) => Emit(h, this pipe t)
+      case Await1(recv,fb,c) =>
+    }
+
 //    p2 match {
 //      case h@Halt(_) => this.kill ++ h
 //      case Emit(h, t) => Emit(h, this pipe t)
@@ -448,8 +543,7 @@ sealed abstract class Process[+F[_],+O] {
    * we gracefully kill off the other side, then halt.
    */
   final def tee[F2[x]>:F[x],O2,O3](p2: Process[F2,O2])(t: Tee[O,O2,O3]): Process[F2,O3] = {
-    import scalaz.stream.tee.{AwaitL,AwaitR}
-//    t match {
+    //    t match {
 //      case h@Halt(_) => this.kill onComplete p2.kill onComplete h
 //      case Emit(h, t2) => Emit(h, this.tee(p2)(t2))
 //      case AwaitL(recv,fb,c) => this.step.flatMap { s =>
@@ -555,6 +649,19 @@ sealed abstract class Process[+F[_],+O] {
    * relies on the `Monad[F]` to ensure stack safety.
    */
   final def runFoldMap[F2[x]>:F[x], B](f: O => B)(implicit F: Monad[F2], C: Catchable[F2], B: Monoid[B]): F2[B] = {
+    def go(cur: Process[F2,O], acc: B): F2[B] = {
+      cur match {
+        case Emit(h,t:Process[F2,O]@unchecked) => go(t,h.foldLeft(acc)((x, y) => B.append(x, f(y))))
+        case Halt(e) => e match {
+          case End => F.point(acc)
+          case _ => C.fail(e)
+        }
+        case AwaitF_(req,recv) =>
+          F.bind (C.attempt(req))({r => go(recv(r).run,acc)})
+      }
+    }
+    go(this, B.zero)
+
 //    def go(cur: Process[F2,O], acc: B): F2[B] =
 //      cur match {
 //        case Emit(h,t) =>
@@ -903,10 +1010,15 @@ object Process {
    * is the next state. If an exception occurs, `cleanup1`
    * is the next state.
    */
-  case class Await_[F[_],A,+O] private[stream](
-    req: F[A],
-    recv: Throwable \/ A => Trampoline[Process[F,O]]) extends NotReady[F,O]
+  case class Await_[F[_],R,+A] private[stream](
+    req: F[R],
+    recv: Throwable \/ R => Trampoline[Process[F,A]]) extends NotReady[F,A]
 
+  object AwaitF_{
+    private[stream] def unapply[F[_],A](self: Process[F,A]):
+    Option[(F[Any], Any => Trampoline[Process[F,A]])] =
+      ???
+  }
 
 /*
 
@@ -962,24 +1074,33 @@ object Process {
     }
   }
 
+
   def emitSeq[F[_],O](
       head: Seq[O],
       tail: Process[F,O] = halt): Process[F,O] = {
-//    if (head.isEmpty) tail
-//    else tail match {
-//      case Emit(h2,t) => Emit(head ++ h2.asInstanceOf[Seq[O]], t.asInstanceOf[Process[F,O]])
-//      case _ => Emit(head, tail)
-//    }
-    ???
+    if (head.isEmpty) tail
+   else tail match {
+     case Emit(h2,t) => Emit(head ++ h2.asInstanceOf[Seq[O]], t.asInstanceOf[Process[F,O]])
+     case _ => Emit(head, tail)
+    }
   }
 
-
+  // like an await, but always wraps the rcv into a Trampoline.suspend
   def awaitS[F[_],A,O](req: F[A])(
     recv: Throwable \/ A => Process[F,O] = (r: Throwable \/ A) =>    r match { case -\/(rsn) => Halt(rsn) ; case \/-(_) =>  halt }
     ): Process[F,O] =
     ??? /// Await(req, recv, fallback, cleanup)
 
+  ///trampolined version of await, this must always suspend the recv in Trampoline.suspend()
+  def awaitT[F[_],R,A](req: F[R])(
+    recv: Throwable \/ R => Trampoline[Process[F,A]] = (r: Throwable \/ R) => r match { case -\/(rsn) => Trampoline.done(Halt(rsn)) ; case \/-(_) =>  Trampoline.done(halt) }
+    ): Process[F,A] =
+    ???
 
+  // like awaitT, but unlike the `awaitT` takes f, that transforms the resulting process after recv
+  // essentially shortcut for awaitT(req)( r => recv(r).map(next _))
+  def awaitTP[F[_],A](req: F[Any], rcv: Throwable \/ Any => Trampoline[Process[F,A]])(next: Process[F,A] => Process[F,A]): Process[F,A] =
+    ???
 
   def await[F[_],A,O](req: F[A])(
       recv: A => Process[F,O] = (a: A) => halt,
@@ -1738,8 +1859,7 @@ object Process {
   implicit class ChanneledProcess[F[_],O,O2](self: Process[F,(O, O => F[O2])]) {
     def enqueue[O3](q: Wye[O,O2,O3])(implicit F: Nondeterminism[F]): Process[F,O3] = ???//go(self, q, Queue(), Queue())
 
-    import wye.{AwaitL,AwaitR,AwaitBoth}
-//    private def go[F3[_],O,O2,O3](src: Process[F3,(O,O => F3[O2])], q: Wye[O,O2,O3], bufIn: Seq[O], bufOut: Queue[F3[O2]])(
+    //    private def go[F3[_],O,O2,O3](src: Process[F3,(O,O => F3[O2])], q: Wye[O,O2,O3], bufIn: Seq[O], bufOut: Queue[F3[O2]])(
 //                  implicit F3: Nondeterminism[F3]): Process[F3,O3] = {
 //      try q match {
 //        case Emit(out, q2) => emitAll(out) ++ go(src, q2, bufIn, bufOut)

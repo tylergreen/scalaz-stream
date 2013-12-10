@@ -114,7 +114,7 @@ sealed abstract class Process[+F[_],+O] {
 //          Await(req, recv andThen (go(_, fb, c)), fb flatMap f, c flatMap f)
 //      }
 //    go(this, halt, halt)
-    ???
+
   }
 
   /**
@@ -150,7 +150,6 @@ sealed abstract class Process[+F[_],+O] {
 //      case Await(req,recv,fb,c) =>
 //        Await(req, recv andThen (_ append p2), fb append p2, c)
 //    }
-    ???
   }
 
   /** Operator alias for `append`. */
@@ -681,7 +680,6 @@ sealed abstract class Process[+F[_],+O] {
 //           }
 //      }
 //    go(this, B.zero)
-    ???
   }
 
   /** Run this `Process` solely for its final emitted value, if one exists. */
@@ -1016,8 +1014,10 @@ object Process {
 
   object AwaitF_{
     private[stream] def unapply[F[_],A](self: Process[F,A]):
-    Option[(F[Any], Any => Trampoline[Process[F,A]])] =
-      ???
+    Option[(F[Any], Throwable \/ Any => Trampoline[Process[F,A]])] = self match {
+      case Await_(req:F[Any]@unchecked,recv:(Throwable \/ Any => Trampoline[Process[F,A]])@unchecked) => Some((req,recv))
+      case _ => None
+    }
   }
 
 /*
@@ -1086,21 +1086,23 @@ object Process {
   }
 
   // like an await, but always wraps the rcv into a Trampoline.suspend
-  def awaitS[F[_],A,O](req: F[A])(
-    recv: Throwable \/ A => Process[F,O] = (r: Throwable \/ A) =>    r match { case -\/(rsn) => Halt(rsn) ; case \/-(_) =>  halt }
-    ): Process[F,O] =
-    ??? /// Await(req, recv, fallback, cleanup)
+  def awaitS[F[_],R,A](req: F[R])(
+    recv: Throwable \/ R => Process[F,A] = (r: Throwable \/ R) =>    r match { case -\/(rsn) => Halt(rsn) ; case \/-(_) =>  halt }
+    ): Process[F,A] =
+    Await_[F,R,A](req, r => Trampoline.done(recv(r)) )
 
   ///trampolined version of await, this must always suspend the recv in Trampoline.suspend()
   def awaitT[F[_],R,A](req: F[R])(
     recv: Throwable \/ R => Trampoline[Process[F,A]] = (r: Throwable \/ R) => r match { case -\/(rsn) => Trampoline.done(Halt(rsn)) ; case \/-(_) =>  Trampoline.done(halt) }
     ): Process[F,A] =
-    ???
+    Await_[F,R,A](req, r => Trampoline.suspend(recv(r)) )
+
 
   // like awaitT, but unlike the `awaitT` takes f, that transforms the resulting process after recv
   // essentially shortcut for awaitT(req)( r => recv(r).map(next _))
-  def awaitTP[F[_],A](req: F[Any], rcv: Throwable \/ Any => Trampoline[Process[F,A]])(next: Process[F,A] => Process[F,A]): Process[F,A] =
-    ???
+  def awaitTP[F[_],A](req: F[Any], recv: Throwable \/ Any => Trampoline[Process[F,A]])(next: Process[F,A] => Process[F,A]): Process[F,A] =
+    awaitT(req)(r => recv(r).map(next(_)))
+
 
   def await[F[_],A,O](req: F[A])(
       recv: A => Process[F,O] = (a: A) => halt,
@@ -1135,11 +1137,15 @@ object Process {
 
   /** Produce a (potentially infinite) source from an unfold. */
   def unfold[S,A](s0: S)(f: S => Option[(A,S)]): Process[Task,A] = {
-//    await(Task.delay(f(s0)))(o =>
-//      o.map(ht => Emit(List(ht._1), unfold(ht._2)(f))).
-//      getOrElse(halt)
-//    )
-    ???
+    awaitS(Task.delay(f(s0)))({
+      case \/-(o) =>  o.map(ht => Emit(List(ht._1), unfold(ht._2)(f))).
+                       getOrElse(halt)
+      case -\/(e) => Halt(e)
+    })
+  /*  await(Task.delay(f(s0)))(o =>
+      o.map(ht => Emit(List(ht._1), unfold(ht._2)(f))).
+      getOrElse(halt)
+    )*/
   }
 
 

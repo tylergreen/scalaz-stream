@@ -80,20 +80,18 @@ sealed abstract class Process[+F[_],+O] {
    * sequence these processes using `append`.
    */
   final def flatMap[F2[x]>:F[x], B](f: O => Process[F2,B]): Process[F2,B] = {
+    def concat(next:Seq[Process[F2,B]], t: Process[F2,B]):Process[F2,B] = {
+      if (next.isEmpty) t
+      else next.head.append(concat(next.tail, t))
+    }
+
     this match {
       case h@Halt(_) => h
-      case AwaitF_(req,recv) => awaitT[F2,Any,B](req)(r=> recv(r).map(p=>p.flatMap(f)))
+      case AwaitF_(req,recv) => Await_(req,recv.andThen(tpl=>tpl.map(p=>p.flatMap(f))))
       case Emit(as,t) =>
-        if (as.nonEmpty) {
-          try (f(as.head) ++ (emitSeq(as.tail,t) flatMap f))
-          catch {
-            case rsn: Throwable => t.killBy(rsn)
-          /*  case rsn: Throwable => t match {
-              case AwaitF_(req,recv) => recv(-\/(rsn)).run flatMap f
-              case _ => Halt(rsn)
-            }*/
-          }
-        } else t flatMap f
+        try concat(as.map(f), t flatMap f) catch {
+          case e : Throwable => t.killBy(e)
+        }
     }
     // a bit of trickness here - in the event that `f` itself throws an
     // exception, we use the most recent fallback/cleanup from the prior `Await`
@@ -127,6 +125,11 @@ sealed abstract class Process[+F[_],+O] {
    * produced by this `Process`. If this is not desired, use `fby`.
    */
   final def append[F2[x]>:F[x], B>:O](p2: => Process[F2,B]): Process[F2,B] = {
+    //hard workaround for Vector bug @see SI-7725.
+    def fast_++[X](s1:Seq[X],s2:Seq[X]):Seq[X] = {
+      if (s2.isEmpty) s1
+      else fast_++(s1 :+ s2.head, s2.tail)
+    }
     this match {
       case h@Halt(End) =>
         try p2
@@ -135,8 +138,12 @@ sealed abstract class Process[+F[_],+O] {
           case e : Throwable => Halt(e)
         }
       case h@Halt(_) => h
-      case Emit(h,t) => emitSeq(h, t append p2)
-      case AwaitF_(req,recv) => awaitTP[F2,B](req,recv)( _ append p2  )
+      case Emit(h,t) =>
+        p2.unemit match {
+          case (hd, _:Halt ) => Emit(fast_++(h,hd), t)
+          case (hd, t2) => Emit(fast_++(h,hd), t ++ t2.asInstanceOf[Process[F,B]])
+        }
+      case AwaitF_(req,recv) => awaitT(req)(recv.andThen(p=>p.map(_ append p2.asInstanceOf[Process[F,B]])))
     }
 
 
@@ -227,7 +234,7 @@ sealed abstract class Process[+F[_],+O] {
         case End => go(this)
         case _ => h
       }
-      case AwaitF_(req,recv) => awaitTP(req,recv)(go)
+      case AwaitF_(req,recv) => awaitT(req)( recv andThen(_.map(p=>go(p))))
       case Emit(h, t) => emitSeq(h, go(t))
     }
     go(this)
@@ -297,7 +304,7 @@ sealed abstract class Process[+F[_],+O] {
   }
   private final def causedBy_[F2[x]>:F[x],O2>:O](e: Throwable): Process[F2, O2] = {
     this match {
-      case AwaitF_(req,rcv) => awaitTP(req, rcv)( _ causedBy_(e))
+      case AwaitF_(req,rcv) => awaitT(req)( rcv.andThen(_.map(p=>p.causedBy_(e))) )
       case Emit(h,t) => Emit(h, t.causedBy_(e))
       case h@Halt(e0) => e0 match {
                     case End => Halt(e)
@@ -394,12 +401,12 @@ sealed abstract class Process[+F[_],+O] {
    *
    *  }}}
    */
-  final def onCleanup[F2[x]>:F[x],B>:O](p2: Throwable => Process[F2,B]): Process[F2,B] = {
+  final def onCleanup[F2[x]>:F[x],B>:O](f: Throwable => Process[F2,B]): Process[F2,B] = {
     this match {
-      case AwaitF_(req,recv) => awaitTP[F2,B](req,recv)(_ onCleanup p2)
-      case Emit(h,t) => Emit(h, t.onCleanup(p2))
+      case AwaitF_(req,recv) => awaitT(req)(recv andThen(_.map(p=>p.onCleanup(f).asInstanceOf[Process[F,B]])))
+      case Emit(h,t) => Emit(h, t.onCleanup(f))
       case h@Halt(e) =>
-        try p2(e)
+        try f(e)
         catch {
           case End => h
           case e2: Throwable => Halt(CausedBy(e2, e))
@@ -530,7 +537,7 @@ sealed abstract class Process[+F[_],+O] {
     this match {
       case h@Halt(_) => h
       case Emit(h, t) => t.drain
-      case AwaitF_(req,recv) => awaitTP[F,Nothing](req,recv.asInstanceOf[scalaz.\/[Throwable,Any] => scalaz.Free.Trampoline[scalaz.stream.Process[F,Nothing]]])( _ drain)
+      case AwaitF_(req,recv) => awaitT(req)( recv.andThen(_.map(p=>p.drain)))
     }
 
 //    this match {
@@ -595,21 +602,6 @@ sealed abstract class Process[+F[_],+O] {
           case Emit(hd,t) => t.pipe(process1.feed(hd)(p2))
           case AwaitF_(req,recv) => awaitT(req)(r => recv(r).map(_.pipe(p2)))
         }
-
-
-//
-//        this.stepT.flatMap {
-//        case Step_.next(hd,tail) => tail.run.pipe(process1.feed(hd)(p2))
-//        case Step_.failed(e,cup) => halt.pipe(recv(left(e)).run)
-//          s =>
-//
-//
-//            s.fold(
-//            hd => s.tail.run.pipe(process1.feed(hd)(p2))
-//           , halt pipe recv(-\/(End)).run
-//           , e => Halt(e) pipe recv(-\/(e)).run
-//          )
-//      }
     }
 
 //    p2 match {
@@ -1236,7 +1228,7 @@ object Process {
       head: Seq[O],
       tail: Process[F,O] = halt): Process[F,O] = {
     if (head.isEmpty) tail
-   else tail match {
+    else tail match {
      case Emit(h2,t) => Emit(head ++ h2.asInstanceOf[Seq[O]], t.asInstanceOf[Process[F,O]])
      case _ => Emit(head, tail)
     }
@@ -1255,10 +1247,7 @@ object Process {
     Await_[F,R,A](req, r => Trampoline.suspend(recv(r)) )
 
 
-  // like awaitT, but unlike the `awaitT` takes f, that transforms the resulting process after recv
-  // essentially shortcut for awaitT(req)( r => recv(r).map(next _))
-  def awaitTP[F[_],A](req: F[Any], recv: Throwable \/ Any => Trampoline[Process[F,A]])(next: Process[F,A] => Process[F,A]): Process[F,A] =
-    awaitT(req)(r => recv(r).map(next(_)))
+
 
 
 
@@ -1495,18 +1484,18 @@ object Process {
 
   /** Emit a single value, then `Halt`. */
   def emit[O](head: O): Process[Nothing,O] =
-    Emit[Nothing,O](List(head), halt)
+    Emit[Nothing,O](Vector(head), halt)
 
   /** Emit a sequence of values, then `Halt`. */
   def emitAll[O](seq: Seq[O]): Process[Nothing,O] =
     emitSeq(seq, halt)
 
   def emitView[O](head: O): Process[Nothing,O] =
-    Emit[Nothing,O](List(head).view, halt)
+    Emit[Nothing,O](Vector(head).view, halt)
 
   def emitLazy[O](head: => O): Process[Nothing,O] = {
     lazy val hd = head
-    Emit[Nothing,O](List(()).view.map(_ => hd), halt)
+    Emit[Nothing,O](Vector(()).view.map(_ => hd), halt)
   }
 
 
@@ -1600,25 +1589,23 @@ object Process {
   def awaitBoth[I,I2]: Wye[I,I2,ReceiveY[I,I2]] =
     await(Both[I,I2])(emit)
 
-  def receive1[I,O](recv: I => Process1[I,O], fallback: Process1[I,O] = halt): Process1[I,O] =
-    Await_(Get[I],(r : (Throwable \/ I)) => Trampoline.delay{
-      r match {
-        case \/-(i:I) => recv(i)
-        case -\/(End) => fallback
-        case -\/(e:Throwable) => Halt(e)
-      }
-    }) // Await(Get[I], recv, fallback, halt)
+  def receive1[I,O](recv: I => Process1[I,O], fallback: => Process1[I,O] = halt): Process1[I,O] =
+    Await_(Get[I],{
+      case \/-(i) => Trampoline.done(recv(i))
+      case -\/(End) => Trampoline.done(fallback)
+      case -\/(e) => Trampoline.done(Halt(e))
+    }:(Throwable \/ I) => Trampoline[Process1[I,O]]) // Await(Get[I], recv, fallback, halt)
 
   def receiveL[I,I2,O](
       recv: I => Tee[I,I2,O],
-      fallback: Tee[I,I2,O] = halt,
-      cleanup: Tee[I,I2,O] = halt): Tee[I,I2,O] =
+      fallback: => Tee[I,I2,O] = halt,
+      cleanup: => Tee[I,I2,O] = halt): Tee[I,I2,O] =
     await[Env[I,I2]#T,I,O](L)(recv, fallback, cleanup)
 
   def receiveR[I,I2,O](
       recv: I2 => Tee[I,I2,O],
-      fallback: Tee[I,I2,O] = halt,
-      cleanup: Tee[I,I2,O] = halt): Tee[I,I2,O] =
+      fallback: => Tee[I,I2,O] = halt,
+      cleanup: => Tee[I,I2,O] = halt): Tee[I,I2,O] =
     await[Env[I,I2]#T,I2,O](R)(recv, fallback, cleanup)
 
   def receiveLOr[I,I2,O](fallback: Tee[I,I2,O])(
@@ -1631,8 +1618,8 @@ object Process {
 
   def receiveBoth[I,I2,O](
       recv: ReceiveY[I,I2] => Wye[I,I2,O],
-      fallback: Wye[I,I2,O] = halt,
-      cleanup: Wye[I,I2,O] = halt): Wye[I,I2,O] =
+      fallback: => Wye[I,I2,O] = halt,
+      cleanup: => Wye[I,I2,O] = halt): Wye[I,I2,O] =
     await[Env[I,I2]#Y,ReceiveY[I,I2],O](Both[I,I2])(recv, fallback, cleanup)
 
   /** A `Writer` which emits one value to the output. */

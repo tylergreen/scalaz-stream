@@ -14,6 +14,7 @@ import scalaz.stream.actor.{WyeActor, message, actors}
 import scala.Some
 import scalaz.\/-
 import scalaz.-\/
+import scalaz.stream.tee.{AwaitR_, AwaitL_, AwaitR, AwaitL}
 
 
 /**
@@ -356,7 +357,7 @@ sealed abstract class Process[+F[_],+O] {
 //      case h@Halt(_) => h
 //    }
 //    go(this)
-    ???
+
   }
 
   /**
@@ -406,7 +407,19 @@ sealed abstract class Process[+F[_],+O] {
   /**
    * Run `p2` after this `Process` if this `Process` completes with an an error.
    */
-  final def onFailure[F2[x]>:F[x],O2>:O](p2: => Process[F2,O2]): Process[F2,O2] = {
+  final def onError[F2[x]>:F[x],O2>:O](p2: Throwable => Process[F2,O2]): Process[F2,O2] = {
+    onCleanup {
+      case End => this
+      case e => p2(e)
+    }
+  }
+
+
+  /**
+   * Run `p2` after this `Process` if this `Process` completes with an an error.
+   */
+  final def onFailure[F2[x]>:F[x],O2>:O](p2: Process[F2,O2]): Process[F2,O2] = {
+    onError { _ => p2}
 //    this match {
 //      case Await(req,recv,fb,c) => Await(req, recv andThen (_.onFailure(p2)), fb, c onComplete p2)
 //      case Emit(h, t) => Emit(h, t.onFailure(p2))
@@ -416,7 +429,6 @@ sealed abstract class Process[+F[_],+O] {
 //        case e2: Throwable => Halt(CausedBy(e2, e))
 //        }
 //    }
-    ???
   }
 
   /**
@@ -425,6 +437,7 @@ sealed abstract class Process[+F[_],+O] {
    * not run `p2` if `p1` halts with an error.
    */
   final def onComplete[F2[x]>:F[x],O2>:O](p2: => Process[F2,O2]): Process[F2,O2] = {
+     onCleanup (_ => p2)
 //    this match {
 //      case Await(req,recv,fb,c) => Await(req, recv andThen (_.onComplete(p2)), fb.onComplete(p2), c.onComplete(p2))
 //      case Emit(h, t) => Emit(h, t.onComplete(p2))
@@ -434,55 +447,67 @@ sealed abstract class Process[+F[_],+O] {
 //        case e2: Throwable => Halt(CausedBy(e2, e))
 //        }
 //    }
-    ???
   }
 
   /**
    * Switch to the `fallback` case of _all_ subsequent awaits.
    */
   final def disconnect: Process[Nothing,O] = {
+    this match {
+      case AwaitF_(req,recv) => recv(\/-(End)).run.disconnect
+      case Emit(h, t) => emitSeq(h, t.disconnect)
+      case h@Halt(_) => h
+    }
+
 //    this match {
 //      case Await(req,recv,fb,c) => fb.disconnect
 //      case Emit(h, t) => emitSeq(h, t.disconnect)
 //      case h@Halt(_) => h
 //    }
-    ???
   }
 
   /**
    * Switch to the `cleanup` case of the next `Await` issued by this `Process`.
    */
   final def cleanup: Process[F,O] = {
+    this match {
+      case AwaitF_(req,recv) => awaitT(req)(r => recv(\/-(Kill)))
+      case Emit(h, t) => emitSeq(h, t.cleanup)
+      case h@Halt(_) => h
+    }
+
 //    this match {
 //      case Await(req,recv,fb,c) => c
 //      case h@Halt(_) => h
 //      case Emit(h, t) => emitSeq(h, t.cleanup)
 //    }
-    ???
   }
 
   /**
    * Switch to the `cleanup` case of _all_ subsequent awaits.
    */
   final def hardDisconnect: Process[Nothing,O] = {
+    this match {
+      case AwaitF_(req,recv) => recv(\/-(Kill)).run.hardDisconnect
+      case Emit(h, t) => emitSeq(h, t.hardDisconnect)
+      case h@Halt(_) => h
+    }
 //    this match {
 //      case Await(req,recv,fb,c) => c.hardDisconnect
 //      case h@Halt(_) => h
 //      case Emit(h, t) => emitSeq(h, t.hardDisconnect)
 //    }
-    ???
   }
 
   /**
    * Remove any leading emitted values from this `Process`.
    */
-  //@annotation.tailrec
+  @annotation.tailrec
   final def trim: Process[F,O] = {
-//    this match {
-//      case Emit(h, t) => t.trim
-//      case _ => this
-//    }
-    ???
+    this match {
+      case Emit(h, t) => t.trim
+      case _ => this
+    }
   }
 
   /** Correctly typed deconstructor for `Await`. */
@@ -543,9 +568,9 @@ sealed abstract class Process[+F[_],+O] {
 
   final def stepT:Process[F, Step_[F,O]] = {
     this match {
-      case h@Halt(e) => emit(Step_(-\/(e) ,h ,_ => Trampoline.done(halt)))
+      case h@Halt(e) => emit(Step_(-\/(e) , Trampoline.done(h) ,_ => Trampoline.done(halt)))
       case Emit(Seq(),t) => t.stepT
-      case Emit(h,t) => emit(Step_(\/-(h), t, e => Trampoline.delay(t.killBy(e))))
+      case Emit(h,t) => emit(Step_(\/-(h), Trampoline.done(t), e => Trampoline.delay(t.killBy(e))))
       case AwaitF_(req,recv) =>  awaitT(req)(r => recv(r).map(_.stepT))
     }
   }
@@ -556,12 +581,17 @@ sealed abstract class Process[+F[_],+O] {
    * values as they are demanded by `p2`. If `p2` signals termination, `this`
    * is killed using `kill`, giving it the opportunity to clean up.
    */
-  final def pipe[O2](p2: Process1[O,O2]): Process[F,O2] = {
+  final def pipe[O2](p2: => Process1[O,O2]): Process[F,O2] = {
+    //todo revisit pipe implementation, specifically handling of trampoline in Await1
     p2 match {
-      case h@Halt(e) => this.causedBy(e) ++ h
+      case h@Halt(e) => this.killBy(e) ++ h
       case Emit(h,t) => Emit(h, this pipe t)
       case Await1_(recv) => this.stepT.flatMap {
-            ???
+          s => s.fold(
+            hd => s.tail.run.pipe(process1.feed(hd)(p2))
+           , halt pipe recv(-\/(End)).run
+           , e => Halt(e) pipe recv(-\/(e)).run
+          )
       }
     }
 
@@ -574,7 +604,6 @@ sealed abstract class Process[+F[_],+O] {
 //        } (halt pipe fb, halt pipe c)
 //      }
 //    }
-    ???
   }
 
   /** Operator alias for `pipe`. */
@@ -593,6 +622,26 @@ sealed abstract class Process[+F[_],+O] {
    * we gracefully kill off the other side, then halt.
    */
   final def tee[F2[x]>:F[x],O2,O3](p2: Process[F2,O2])(t: Tee[O,O2,O3]): Process[F2,O3] = {
+    t match {
+      case h@Halt(_) => this.kill onComplete p2.kill onComplete h
+      case Emit(h, t2) => Emit(h, this.tee(p2)(t2))
+      case AwaitL_(recv) => this.stepT.flatMap {
+       s => s.fold(
+         hd => s.tail.run.tee(p2)(scalaz.stream.tee.feedL(hd)(t))
+         , halt.tee(p2)(recv(-\/(End)).run)
+         , e => halt.tee(p2)(recv(-\/(e)).run)
+       )
+      }
+      case AwaitR_(recv) => p2.stepT.flatMap {
+        s => s.fold(
+          hd => this.tee(s.tail.run)(scalaz.stream.tee.feedR(hd)(t))
+          , this.tee(halt)(recv(-\/(End)).run)
+          , e => this.tee(halt)(recv(-\/(e)).run)
+        )
+      }
+    }
+
+
     //    t match {
 //      case h@Halt(_) => this.kill onComplete p2.kill onComplete h
 //      case Emit(h, t2) => Emit(h, this.tee(p2)(t2))
@@ -607,7 +656,6 @@ sealed abstract class Process[+F[_],+O] {
 //        } (this.tee(halt)(fb), this.tee(halt)(c))
 //      }
 //    }
-    ???
   }
 
   /** Translate the request type from `F` to `G`, using the given polymorphic function. */
@@ -628,6 +676,30 @@ sealed abstract class Process[+F[_],+O] {
   def attempt[F2[x]>:F[x],O2](f: Throwable => Process[F2,O2] = (t:Throwable) => emit(t))(
                               implicit F: Catchable[F2]): Process[F2, O2 \/ O] =
   {
+    this match {
+      case Emit(h, t) => Emit(h map (right), t.attempt[F2,O2](f))
+      case Halt(e) => e match {
+        case End => halt
+        case _ => try f(e).map(left) catch {
+          case End => halt
+          case e2: Throwable => Halt(CausedBy(e2, e))
+        }
+      }
+      case AwaitF_(req, recv) =>
+        awaitT(F.attempt(req))(
+          _.flatMap(v=>v).fold(
+          {
+            case End => recv(left(End)).map(_.attempt(f))
+            case e => recv(left(e)).map(_.drain.onComplete(f(e).map(left))) //todo: catch exceptions while evaluating `f`
+          }
+          , r => recv(right(r)).map(_.attempt(f))
+          )
+        )
+
+
+    }
+
+
 //    this match {
 //      case Emit(h, t) => Emit(h map (right), t.attempt[F2,O2](f))
 //      case Halt(e) => e match {
@@ -647,7 +719,6 @@ sealed abstract class Process[+F[_],+O] {
 //          ),
 //          fb.attempt[F2,O2](f), c.attempt[F2,O2](f))
 //    }
-    ???
   }
 
   /**
@@ -1509,7 +1580,13 @@ object Process {
     await(Both[I,I2])(emit)
 
   def receive1[I,O](recv: I => Process1[I,O], fallback: Process1[I,O] = halt): Process1[I,O] =
-   ??? // Await(Get[I], recv, fallback, halt)
+    Await_(Get[I],(r : (Throwable \/ I)) => Trampoline.delay{
+      r match {
+        case \/-(i:I) => recv(i)
+        case -\/(End) => fallback
+        case -\/(e:Throwable) => Halt(e)
+      }
+    }) // Await(Get[I], recv, fallback, halt)
 
   def receiveL[I,I2,O](
       recv: I => Tee[I,I2,O],
@@ -2026,6 +2103,25 @@ object Process {
      * or `gather`.
      */
     def eval: Process[F,O] = {
+     /* def go(cur: Process[F,F[O]], recv: Throwable  => Trampoline[Process[F,O]]) : Process[F,O] = {
+        cur match {
+          case Halt(e) => recv(e).run
+          case Emit(h,t) =>
+            if (h.isEmpty) go(t, recv)
+            else awaitT(h.head)({
+              case \/-(o) => Trampoline.delay(Emit(List(o), go(Emit(h.tail,t),recv)))
+              case -\/(e) => recv(e)
+            })
+          case AwaitF_(req,recv1) =>
+            awaitT[F,Any,F[O]](req)({
+              case \/-(r) => go(r,e => recv1(left(e)).map(_.eval))
+              case -\/(e) => recv1(left(e)).map(_.eval)
+            })
+        }
+      }
+      go(self,_=>Trampoline.done(halt))*/
+
+
 //      def go(cur: Process[F,F[O]], fallback: Process[F,O], cleanup: Process[F,O]): Process[F,O] =
 //        cur match {
 //          case Halt(e) => e match {

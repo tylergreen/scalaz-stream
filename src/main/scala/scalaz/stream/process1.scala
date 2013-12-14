@@ -110,22 +110,36 @@ trait process1 {
 
   /** Feed a sequence of inputs to a `Process1`. */
   def feed[I,O](i: Seq[I])(p: Process1[I,O]): Process1[I,O] = {
-    @annotation.tailrec
     def go(in: Seq[I], out: Vector[Seq[O]], cur: Process1[I,O]): Process1[I,O] =
       if (in.nonEmpty) cur match {
         case h@Halt(_) => emitSeq(out.flatten, h)
         case Emit(h, t) => go(in, out :+ h, t)
-        case Await1(recv, fb, c) =>
-          val next =
-            try recv(in.head)
-            catch {
-              case End => fb
-              case e: Throwable => c.causedBy(e)
-            }
-          go(in.tail, out, next)
+        case Await1_(recv) =>
+          val next = try recv(right(in.head)).run catch {
+            case e: Throwable => recv(left(e)).run
+          }
+          go(in.tail,out,next)
       }
       else emitSeq(out.flatten, cur)
-    go(i, Vector(), p)
+
+    go(i,Vector(),p)
+
+//    @annotation.tailrec
+//    def go(in: Seq[I], out: Vector[Seq[O]], cur: Process1[I,O]): Process1[I,O] =
+//      if (in.nonEmpty) cur match {
+//        case h@Halt(_) => emitSeq(out.flatten, h)
+//        case Emit(h, t) => go(in, out :+ h, t)
+//        case Await1(recv, fb, c) =>
+//          val next =
+//            try recv(in.head)
+//            catch {
+//              case End => fb
+//              case e: Throwable => c.causedBy(e)
+//            }
+//          go(in.tail, out, next)
+//      }
+//      else emitSeq(out.flatten, cur)
+//    go(i, Vector(), p)
   }
 
   /** Skips any elements of the input not matching the predicate. */

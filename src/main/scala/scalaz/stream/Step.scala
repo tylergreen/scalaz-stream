@@ -30,10 +30,15 @@ object Step {
 /** trampolined version of step **/
 case class Step_[+F[_],+A](
   head: Throwable \/ Seq[A]
-  , tail: Process[F,A]
+  , tail: Trampoline[Process[F,A]]
   , cleanup: Throwable => Trampoline[Process[F,A]]) {
 
-  def fold[R](success: Seq[A] => R)(fallback: => R, error: => R): R =
-    head.fold(e => if (e == Process.End) fallback else error, success)
+  def fold[R](success: Seq[A] => R, fallback: => R, error: Throwable => R): R = {
+    head.fold({
+      case  End => fallback
+      case  e => error(e)
+    }
+    , success)
+  }
 
 }

@@ -39,10 +39,12 @@ sealed abstract class Process[+F[_],+O] {
       case Emit(h,t) =>
         try Emit[F,B](h map f, t map f)
         catch {
-          case rsn: Throwable => t match {
+          case rsn: Throwable => t.killBy(rsn)
+
+         /* case rsn: Throwable => t match {
             case AwaitF_(req,recv) => recv(-\/(rsn)).run map f
             case _ => Halt(rsn)   //this assumes that emit has in tail only `NotReady`
-          }
+          }*/
         }
     }
 
@@ -85,10 +87,11 @@ sealed abstract class Process[+F[_],+O] {
         if (as.nonEmpty) {
           try (f(as.head) ++ (emitSeq(as.tail,t) flatMap f))
           catch {
-            case rsn: Throwable => t match {
+            case rsn: Throwable => t.killBy(rsn)
+          /*  case rsn: Throwable => t match {
               case AwaitF_(req,recv) => recv(-\/(rsn)).run flatMap f
               case _ => Halt(rsn)
-            }
+            }*/
           }
         } else t flatMap f
     }
@@ -586,13 +589,27 @@ sealed abstract class Process[+F[_],+O] {
     p2 match {
       case h@Halt(e) => this.killBy(e) ++ h
       case Emit(h,t) => Emit(h, this pipe t)
-      case Await1_(recv) => this.stepT.flatMap {
-          s => s.fold(
-            hd => s.tail.run.pipe(process1.feed(hd)(p2))
-           , halt pipe recv(-\/(End)).run
-           , e => Halt(e) pipe recv(-\/(e)).run
-          )
-      }
+      case Await1_(recv1) =>
+        this match {
+          case h@Halt(e) => h.pipe(recv1(left(e)).run)
+          case Emit(hd,t) => t.pipe(process1.feed(hd)(p2))
+          case AwaitF_(req,recv) => awaitT(req)(r => recv(r).map(_.pipe(p2)))
+        }
+
+
+//
+//        this.stepT.flatMap {
+//        case Step_.next(hd,tail) => tail.run.pipe(process1.feed(hd)(p2))
+//        case Step_.failed(e,cup) => halt.pipe(recv(left(e)).run)
+//          s =>
+//
+//
+//            s.fold(
+//            hd => s.tail.run.pipe(process1.feed(hd)(p2))
+//           , halt pipe recv(-\/(End)).run
+//           , e => Halt(e) pipe recv(-\/(e)).run
+//          )
+//      }
     }
 
 //    p2 match {
@@ -1568,7 +1585,11 @@ object Process {
   def fail(e: Throwable): Process[Nothing,Nothing] = Halt(e)
 
   def await1[I]: Process1[I,I] =
-    await(Get[I])(emit)
+    Await_(Get[I],{
+      case \/-(i) => Trampoline.done(emit(i))
+      case -\/(e) => Trampoline.done(Halt(e))
+    }:(Throwable \/ I) => Trampoline[Process1[I,I]])
+    //await(Get[I])(emit)
 
   def awaitL[I]: Tee[I,Any,I] =
     await(L[I])(emit)

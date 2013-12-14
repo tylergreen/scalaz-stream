@@ -42,3 +42,24 @@ case class Step_[+F[_],+A](
   }
 
 }
+
+object Step_ {
+
+  object next {
+
+    def unapply[F[_],A](s:Step_[F,A]) : Option[(Seq[A],Trampoline[Process[F,A]])] =  s.head match {
+      case \/-(a) => Some((a,s.tail))
+      case _ => None
+    }
+
+  }
+
+  object failed {
+    def unapply[F[_],A](s:Step_[F,A]) : Option[(Throwable,Trampoline[Process[F,A]])] =  s.head match {
+      case -\/(e) => Some((e,s.cleanup(e)))
+      case _ => None
+    }
+  }
+
+
+}
